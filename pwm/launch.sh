@@ -210,7 +210,9 @@ ensure_container() {
 install_cc_shim() {
   local name="$1"
   run docker exec "$name" bash -c '
+set -e
 CC='"$VENV"'/neuronx-cc
+[ -x "$CC" ] || { echo "compile throttle: no neuronx-cc at $CC" >&2; exit 1; }
 [ -f "$CC.real" ] && { echo "compile throttle present"; exit 0; }
 mv "$CC" "$CC.real"
 cat > "$CC" <<"SHIM"
@@ -226,7 +228,12 @@ while :; do
   sleep 5
 done
 SHIM
-chmod +x "$CC"; echo "compile throttle installed"'
+chmod +x "$CC"
+# Verify rather than assume: a wrong $VENV used to leave every step above failing
+# while this function still printed success, and an unthrottled 64-rank first-touch
+# compile wave swap-thrashes the box.
+[ -x "$CC" ] && [ -x "$CC.real" ] || { echo "compile throttle: install FAILED" >&2; exit 1; }
+echo "compile throttle installed"'
 }
 
 # ----------------------------------------------------------------------------- pip
