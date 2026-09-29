@@ -29,7 +29,13 @@
 set -euo pipefail
 
 DIGEST="${PWM_IMAGE:?set PWM_IMAGE to the Neuron native-PyTorch container image (see header)}"
-DKMS_REQUIRED="${DKMS_REQUIRED:-2.28.0.0}"  # host driver verified with the runtime pwm was developed on (async h2d CQ interface)
+# Host driver the container's runtime expects. This is PAIRED WITH THE IMAGE, not fixed:
+#   Beta 3 (torch 2.11): 2.28.0.0 -- 2.29+ cannot DMA the Q7 pooling ucode through its firmware
+#   Beta 5 (torch 2.12): 2.30.2.0 -- ships on SDK 2.32 DLAMI 20260818, matches exactly
+#   Beta 6 (torch 2.13): 2.30.2.0 works (its bundled 2.x dev debs ask for newer; the resulting
+#                        warnings are non-fatal -- compile, execute and sampling all succeed)
+# Override to match your image.
+DKMS_REQUIRED="${DKMS_REQUIRED:-2.30.2.0}"
 # The DLC's native-torch venv; bare `python` can mix interpreters. Beta 3/4 ship it at
 # /opt/torch-neuronx/.venv/bin; Beta 5/6 dropped that and use the system interpreter at
 # /usr/local/bin. Leave unset to autodetect from the image (detect_venv), or pin it.
@@ -80,7 +86,10 @@ preflight() {
     echo "driver      : aws-neuronx-dkms $drv  OK"
   else
     echo "driver      : aws-neuronx-dkms '${drv:-not loaded}'  FAIL (need $DKMS_REQUIRED)"
-    echo "  fix (DLAMI holds the package; --allow-change-held-packages is required; then reboot or reload the module):"
+    echo "  the driver must match the IMAGE (Beta 3 -> 2.28.0.0; Beta 5/6 -> 2.30.2.0)."
+    echo "  If the image is NEWER than the host driver, prefer a newer DLAMI, or install the"
+    echo "  image-bundled debs inside the container: dpkg -i /workspace/runtime_artifacts/*.deb"
+    echo "  To move the HOST driver instead (DLAMI holds the package; then reboot or reload):"
     echo "    sudo apt-get update -qq && sudo apt-mark unhold aws-neuronx-dkms && \\"
     echo "    sudo apt-get install -y --allow-downgrades --allow-change-held-packages aws-neuronx-dkms=$DKMS_REQUIRED && \\"
     echo "    sudo apt-mark hold aws-neuronx-dkms && sudo reboot"
