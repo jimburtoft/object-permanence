@@ -30,7 +30,10 @@ set -euo pipefail
 
 DIGEST="${PWM_IMAGE:?set PWM_IMAGE to the Neuron native-PyTorch container image (see header)}"
 DKMS_REQUIRED="${DKMS_REQUIRED:-2.28.0.0}"  # host driver verified with the runtime pwm was developed on (async h2d CQ interface)
-VENV=/opt/torch-neuronx/.venv/bin           # the DLC's native-torch venv; bare `python` mixes interpreters
+# The DLC's native-torch venv; bare `python` can mix interpreters. Beta 3/4 ship it at
+# /opt/torch-neuronx/.venv/bin; Beta 5/6 dropped that and use the system interpreter at
+# /usr/local/bin. Leave unset to autodetect from the image (detect_venv), or pin it.
+VENV="${VENV:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_HOST="${REPO_HOST:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 WEIGHTS_HOST="${WEIGHTS_HOST:-$HOME/weights}"
@@ -39,6 +42,26 @@ NEFF_HOST="${NEFF_HOST:-$HOME/neff_cache}"
 NEURONX_CC_SLOTS="${NEURONX_CC_SLOTS:-8}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# Locate the image's python. Beta 3/4: /opt/torch-neuronx/.venv/bin. Beta 5/6: /usr/local/bin.
+# Set VENV explicitly to skip the probe. Runs once; every caller goes through ensure_container
+# or preflight, both of which call this first.
+detect_venv() {
+  [ -n "$VENV" ] && return 0
+  command -v docker >/dev/null || return 0        # preflight reports missing docker itself
+  docker image inspect "$DIGEST" >/dev/null 2>&1 || return 0   # ditto for an unpulled image
+  local c
+  for c in /opt/torch-neuronx/.venv/bin /usr/local/bin; do
+    if docker run --rm --entrypoint test "$DIGEST" -x "$c/python" 2>/dev/null; then
+      VENV="$c"
+      log "venv in image: $VENV"
+      return 0
+    fi
+  done
+  echo "launch.sh: no python found in $DIGEST (tried /opt/torch-neuronx/.venv/bin and" >&2
+  echo "  /usr/local/bin). Set VENV=<dir containing python> explicitly." >&2
+  exit 1
+}
+
 usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 run() { if [ "$DRY_RUN" = 1 ]; then printf '+ %q' "$1"; shift; for a in "$@"; do printf ' %q' "$a"; done; printf '\n'; else "$@"; fi; }
@@ -46,6 +69,7 @@ run() { if [ "$DRY_RUN" = 1 ]; then printf '+ %q' "$1"; shift; for a in "$@"; do
 # ----------------------------------------------------------------------------- preflight (host)
 preflight() {
   local fail=0 busy=0
+  detect_venv
   echo "== pwm preflight $(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname) =="
 
   # 1. host driver row. /sys/module/neuron/version works on Ubuntu DLAMI and AL2023 alike.
@@ -140,6 +164,7 @@ print(f"{n} runtime(s), {len(cores)} core(s) with resident memory")' 2>/dev/null
 # ----------------------------------------------------------------------------- container
 ensure_container() {
   local name="$1"
+  detect_venv
   for d in "$WEIGHTS_HOST/Cosmos3-Nano" "$REPO_HOST/pwm"; do
     [ -d "$d" ] || { echo "missing $d" >&2; [ "$DRY_RUN" = 1 ] || exit 1; }
   done
