@@ -272,7 +272,9 @@ class _NkiFlashAttnFn(torch.autograd.Function):
             out, neg_max, recip = ret
         out = out.reshape(b, h, tp, dh)
         out = out[:, :, :t, :] if need else out
-        ctx.save_for_backward(q, k, v, out, neg_max, recip, bmin, bmax)
+        # Save the PRE-SCALED q (what the forward kernel actually consumed, in q.dtype) so the
+        # backward recomputes exactly the scores whose softmax stats it is handed.
+        ctx.save_for_backward(q * scale, k, v, out, neg_max, recip, bmin, bmax)
         ctx.scale = scale
         ctx.dims = (b, h, t, dh, tp, need)
         return out.to(v.dtype)
@@ -307,7 +309,7 @@ class _NkiFlashAttnFn(torch.autograd.Function):
             lse,
             use_causal_mask=False,
             mixed_precision=True,
-            softmax_scale=ctx.scale,
+            softmax_scale=1.0,  # q is pre-scaled (see forward)
             bound_min=bmin_p.to(torch.float32).contiguous(),
             bound_max=bmax_p.to(torch.float32).contiguous(),
         )
@@ -320,7 +322,7 @@ class _NkiFlashAttnFn(torch.autograd.Function):
             g = g.reshape(b, h, dh, tp).transpose(-1, -2)
             return (g[:, :, :t, :] if need else g).contiguous().to(q.dtype)
 
-        return unpad(dQ), unpad(dK), unpad(dV), None, None
+        return unpad(dQ) * ctx.scale, unpad(dK), unpad(dV), None, None  # d/dq = s * d/d(q*s)
 
 
 def nki_two_way(
