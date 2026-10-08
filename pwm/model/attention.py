@@ -306,6 +306,7 @@ class _NkiFlashAttnFn(torch.autograd.Function):
             dyb,
             lse,
             use_causal_mask=False,
+            mixed_precision=True,
             softmax_scale=ctx.scale,
             bound_min=bmin_p.to(torch.float32).contiguous(),
             bound_max=bmax_p.to(torch.float32).contiguous(),
