@@ -13,7 +13,9 @@ Padding: a caption or prompt shorter than ``text_len`` is padded to it and ``key
 the pad keys) hides those keys from the vision rows, written as ``torch.where(mask, -inf, scores)`` on the fp32
 scores exactly like the causal text mask — an additive ``-inf`` bias on the scores gave NaN loss on the very
 first training step on Neuron (2026-09-16, trn2.48xlarge), the ``where`` form trains. Real text rows never
-reach the pads (causal). The NKI path takes contiguous bounds and cannot express it: it raises. Layout: token-major ``[N, H, D]`` per sample; backends transpose to
+reach the pads (causal). The NKI path takes one contiguous bound pair per row, so for a padded caption it reorders
+the K/V slots to ``[pad | real text | vision]`` (``padded_two_way_bounds``), which makes every row one interval.
+Layout: token-major ``[N, H, D]`` per sample; backends transpose to
 ``(1, H, N, D)`` internally.
 NKI constraints: K seqlen padded to a multiple of 512, Q tiled in groups of 128, backward capped at
 seqlen 8,192 on the current nkilib.
@@ -450,8 +452,20 @@ if __name__ == "__main__":
     assert not torch.allclose(sdpa_two_way(q, k3, v3, Lt)[Lt:], sdpa_two_way(q, k, v, Lt)[Lt:])
     assert torch.equal(sdpa_two_way(q, k, v, Lt, torch.zeros(N, dtype=torch.bool)), sdpa_two_way(q, k, v, Lt))  # empty mask = no-op
     try:
-        two_way_attention("nki_flash", q, k, v, Lt, bias)
-        raise AssertionError("nki_flash + key_mask must raise")
+        two_way_attention("nki_flash", q, k, v, Lt, bias)  # a bare key_mask, without the permuted bounds
+        raise AssertionError("nki_flash + bare key_mask must raise")
     except ValueError:
         pass
+    # The permuted-bounds construction the NKI path uses for padding, checked on CPU with an explicit
+    # bounds-masked attention: every real row (text < n_valid, all vision) must equal sdpa_two_way.
+    perm, bmn, bmx = padded_two_way_bounds(Lt, n_valid, N)
+    kp, vp = k.index_select(0, perm), v.index_select(0, perm)
+    scores = torch.einsum("nhd,mhd->hnm", q.float(), kp.float()) / math.sqrt(q.shape[-1])
+    idx = torch.arange(N)
+    live = (idx[None, :] >= bmn[:, None]) & (idx[None, :] < bmx[:, None])
+    scores = torch.where(live[None], scores, torch.full_like(scores, float("-inf")))
+    bounded = torch.einsum("hnm,mhd->nhd", torch.softmax(scores, -1), vp.float()).to(q.dtype)
+    want = sdpa_two_way(q, k, v, Lt, bias)
+    real = torch.cat([torch.arange(n_valid), torch.arange(Lt, N)])
+    assert torch.allclose(bounded[real], want[real], atol=1e-5), (bounded[real] - want[real]).abs().max()
     print("attention smoke OK")
