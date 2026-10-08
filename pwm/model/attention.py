@@ -150,6 +150,20 @@ def _load_nki_bwd_kernel():
     return _nki_bwd_kernel
 
 
+def _preload_nki_kernels() -> None:
+    """Resolve the nkilib kernels at import, not on first call. The lazy loaders assign module globals;
+    reached inside a compiled block (via the autograd.Function) that is an unsafe side effect, so dynamo
+    graph-breaks around the attention in every block and then recompiles on the changed global."""
+    try:
+        _load_nki_kernel()
+        _load_nki_bwd_kernel()
+    except ImportError:  # CPU-only environments without nkilib: the sdpa path never needs them
+        pass
+
+
+_preload_nki_kernels()
+
+
 _NKI_Q_GRP_SZ = 128  # kernel tiles Q in groups of this size
 _NKI_SEQ_PAD = 512  # nkilib requires key seq_len % 512 == 0
 
