@@ -57,12 +57,22 @@ def expand_kv(x: torch.Tensor, groups: int) -> torch.Tensor:
     return x[:, :, None, :].expand(n, hkv, groups, d).reshape(n, hkv * groups, d)
 
 
-def two_way_bounds(text_len: int, total_len: int, device=None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-query contiguous KV range: text row i → ``[0, i+1)``; vision row → ``[0, N)``. Shapes ``[N]`` long."""
-    bmin = torch.zeros(total_len, dtype=torch.long, device=device)
-    bmax = torch.full((total_len,), total_len, dtype=torch.long, device=device)
-    bmax[:text_len] = torch.arange(1, text_len + 1, device=device)
-    return bmin, bmax
+def two_way_bounds(
+    text_len: int, total_len: int, device=None, dtype: torch.dtype = torch.long
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query contiguous KV range: text row i → ``[0, i+1)``; vision row → ``[0, N)``. Shapes ``[N]``.
+
+    Callers on the NKI path must build bounds ONCE, eagerly, outside the compiled blocks, and pass them in
+    (see ``NanoMoT.forward``): built inside a ``torch.compile(backend="neuron")`` region they lowered to
+    ``2**43`` on every vision row, which made ``attention_cte`` behave causally."""
+    # Built on CPU, then moved. Two separate Beta 6 issues make on-device construction unsafe:
+    #   * inside a compiled region, full()+slice-assign lowers to 2**43 on the vision rows;
+    #   * eagerly, a comparison producing a bool tensor (idx < text_len) falls back to host
+    #     (aten::_to_copy), which trips pwm's own fallback-op guard at the first step.
+    bmax = torch.full((total_len,), total_len, dtype=dtype)
+    bmax[:text_len] = torch.arange(1, text_len + 1, dtype=dtype)
+    bmin = torch.zeros(total_len, dtype=dtype)
+    return bmin.to(device), bmax.to(device)
 
 
 def _to_bhtd(x: torch.Tensor) -> torch.Tensor:  # [N,H,D] -> (1,H,N,D)
@@ -312,10 +322,19 @@ class _NkiFlashAttnFn(torch.autograd.Function):
         return unpad(dQ), unpad(dK), unpad(dV), None, None
 
 
-def nki_two_way(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, text_len: int) -> torch.Tensor:
-    """One ``attention_cte`` call with two-way bounds. ``q, k, v`` ``[N, H, D]`` (k/v GQA-expanded)."""
+def nki_two_way(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    text_len: int,
+    bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """One ``attention_cte`` call with two-way bounds. ``q, k, v`` ``[N, H, D]`` (k/v GQA-expanded).
+
+    ``bounds`` ``(bmin, bmax)`` ``[N]``: pass precomputed, eagerly-built bounds (the compiled path must) --
+    see ``two_way_bounds``. ``None`` computes them here (eager callers / tests only)."""
     n = q.shape[0]
-    bmin, bmax = two_way_bounds(text_len, n, device=q.device)
+    bmin, bmax = bounds if bounds is not None else two_way_bounds(text_len, n, device=q.device)
     out = nki_flash_attention(_to_bhtd(q), _to_bhtd(k), _to_bhtd(v), (bmin[None], bmax[None]))
     return _from_bhtd(out)
 
@@ -328,6 +347,7 @@ def two_way_attention(
     v: torch.Tensor,
     text_len: int,
     key_mask: torch.Tensor | None = None,
+    bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     kind = AttentionKind(kind)
     if kind is AttentionKind.SDPA:
@@ -335,7 +355,7 @@ def two_way_attention(
     if key_mask is not None:
         raise ValueError("nki_flash attention takes contiguous bounds and cannot hide padded text keys; "
                          "infer with a padded prompt needs model.attention_backend: sdpa")
-    return nki_two_way(q, k, v, text_len)
+    return nki_two_way(q, k, v, text_len, bounds)
 
 
 def pad_key_mask(text_len: int, text_valid: int, total_len: int, device=None) -> torch.Tensor:
