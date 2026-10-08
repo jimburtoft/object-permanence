@@ -75,6 +75,28 @@ def two_way_bounds(
     return bmin.to(device), bmax.to(device)
 
 
+def padded_two_way_bounds(
+    text_len: int, text_valid: int, total_len: int, device=None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NKI path for a padded caption: ``(kv_perm, bmin, bmax)``.
+
+    ``kv_perm`` ``[N]`` long reorders K/V slots to ``[pad | real text | vision]`` so the padding is a prefix and
+    every query row is ONE contiguous key interval (``attention_cte`` takes a single bound pair per row):
+    real text row ``i`` -> ``[Lt-tv, Lt-tv+i+1)``, vision -> ``[Lt-tv, N)``, pad rows -> ``[Lt-tv, Lt)``.
+    Pad-row outputs differ from the sdpa path but never reach the loss (no real row attends to a pad key).
+    Built on CPU then moved -- see ``two_way_bounds`` for why."""
+    lt, tv, n = text_len, text_valid, total_len
+    if not 0 < tv <= lt:
+        raise ValueError(f"text_valid={tv} must be in (0, text_len={lt}]")
+    npad = lt - tv
+    kv_perm = torch.cat([torch.arange(tv, lt), torch.arange(0, tv), torch.arange(lt, n)])
+    bmin = torch.full((n,), npad, dtype=torch.long)
+    bmax = torch.full((n,), n, dtype=torch.long)
+    bmax[:tv] = torch.arange(npad + 1, npad + tv + 1)
+    bmax[tv:lt] = lt
+    return kv_perm.to(device), bmin.to(device), bmax.to(device)
+
+
 def _to_bhtd(x: torch.Tensor) -> torch.Tensor:  # [N,H,D] -> (1,H,N,D)
     return x.transpose(0, 1).unsqueeze(0)
 
@@ -337,7 +359,13 @@ def nki_two_way(
     ``bounds`` ``(bmin, bmax)`` ``[N]``: pass precomputed, eagerly-built bounds (the compiled path must) --
     see ``two_way_bounds``. ``None`` computes them here (eager callers / tests only)."""
     n = q.shape[0]
-    bmin, bmax = bounds if bounds is not None else two_way_bounds(text_len, n, device=q.device)
+    kv_perm = None
+    if bounds is not None and len(bounds) == 3:  # padded caption: (kv_perm, bmin, bmax)
+        kv_perm, bmin, bmax = bounds
+    else:
+        bmin, bmax = bounds if bounds is not None else two_way_bounds(text_len, n, device=q.device)
+    if kv_perm is not None:
+        k, v = k.index_select(0, kv_perm), v.index_select(0, kv_perm)
     out = nki_flash_attention(_to_bhtd(q), _to_bhtd(k), _to_bhtd(v), (bmin[None], bmax[None]))
     return _from_bhtd(out)
 
@@ -355,9 +383,9 @@ def two_way_attention(
     kind = AttentionKind(kind)
     if kind is AttentionKind.SDPA:
         return sdpa_two_way(q, k, v, text_len, key_mask)
-    if key_mask is not None:
-        raise ValueError("nki_flash attention takes contiguous bounds and cannot hide padded text keys; "
-                         "infer with a padded prompt needs model.attention_backend: sdpa")
+    if key_mask is not None and (bounds is None or len(bounds) != 3):
+        raise ValueError("nki_flash with a padded caption needs the (kv_perm, bmin, bmax) bounds built by "
+                         "NanoMoT.forward (padded_two_way_bounds); a bare key_mask cannot be expressed")
     return nki_two_way(q, k, v, text_len, bounds)
 
 
